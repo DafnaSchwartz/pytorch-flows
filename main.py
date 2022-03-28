@@ -2,6 +2,7 @@ import argparse
 import copy
 import math
 import sys
+import ipdb
 
 import numpy as np
 import torch
@@ -9,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
+import sklearn.metrics as metrics
+import matplotlib.pylab as plt
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 
@@ -55,6 +58,11 @@ parser.add_argument(
     default=False,
     help='train class conditional flow (only for MNIST)')
 parser.add_argument(
+    '--eval-only',
+    action='store_true',
+    default=False,
+    help='eval only')
+parser.add_argument(
     '--num-blocks',
     type=int,
     default=5,
@@ -78,7 +86,7 @@ if args.cuda:
 kwargs = {'num_workers': 4, 'pin_memory': True} if args.cuda else {}
 
 assert args.dataset in [
-    'POWER', 'GAS', 'HEPMASS', 'MINIBONE', 'BSDS300', 'MOONS', 'MNIST'
+    'POWER', 'GAS', 'HEPMASS', 'MINIBONE', 'BSDS300', 'MOONS', 'MNIST', 'GAIT', 'PD_WRIST','PHYSIONET'
 ]
 dataset = getattr(datasets, args.dataset)()
 
@@ -134,7 +142,10 @@ num_hidden = {
     'MINIBOONE': 512,
     'BSDS300': 512,
     'MOONS': 64,
-    'MNIST': 1024
+    'MNIST': 1024,
+    'GAIT': 512,
+    'PD_WRIST': 350,
+    'PHYSIONET': 256
 }[args.dataset]
 
 act = 'tanh' if args.dataset is 'GAS' else 'relu'
@@ -256,7 +267,7 @@ def train(epoch):
             module.momentum = 1
 
 
-def validate(epoch, model, loader, prefix='Validation'):
+def validate(epoch, model, loader, prefix='Validation', full_data=False):
     global global_step, writer
 
     model.eval()
@@ -264,6 +275,7 @@ def validate(epoch, model, loader, prefix='Validation'):
 
     pbar = tqdm(total=len(loader.dataset))
     pbar.set_description('Eval')
+    eval_res_list = []
     for batch_idx, data in enumerate(loader):
         if isinstance(data, list):
             if len(data) > 1:
@@ -274,8 +286,10 @@ def validate(epoch, model, loader, prefix='Validation'):
 
             data = data[0]
         data = data.to(device)
-        with torch.no_grad():
-            val_loss += -model.log_probs(data, cond_data).sum().item()  # sum up batch loss
+        with torch.no_grad():            
+            res = model.log_probs(data, cond_data)
+            val_loss += -res.sum().item()  # sum up batch loss
+            eval_res_list.append(res.cpu().numpy())
         pbar.update(data.size(0))
         pbar.set_description('Val, Log likelihood in nats: {:.6f}'.format(
             -val_loss / pbar.n))
@@ -283,14 +297,36 @@ def validate(epoch, model, loader, prefix='Validation'):
     writer.add_scalar('validation/LL', val_loss / len(loader.dataset), epoch)
 
     pbar.close()
+    if full_data:
+        return np.concatenate(eval_res_list)
     return val_loss / len(loader.dataset)
 
+def calc_performance(val_data,test_data,val_ratio):
+    '''
+    val data: likelihood array of the validation set
+    test data: likelihood array of the test set
+    val_ratio: ratio between the normal set size and the validation set size
+    '''
+    val_data_repeat = clear_nan(np.repeat(val_data,val_ratio))
+    test_data_reshape = clear_nan(np.squeeze(test_data))
+    pred = np.concatenate([test_data_reshape,val_data_repeat])
+    pred = -np.clip(pred, -1000,1000)
+    labels = np.concatenate([np.ones_like(test_data_reshape),np.zeros_like(val_data_repeat)])
+    precision, recall, thresholds = metrics.precision_recall_curve(labels, pred)
+    return precision, recall, thresholds
 
+def clear_nan(array):
+    nan_array = np.isnan(array)
+    not_nan_array = ~ nan_array
+    array = array[not_nan_array]
+    return array
 best_validation_loss = float('inf')
 best_validation_epoch = 0
 best_model = model
 
 for epoch in range(args.epochs):
+    if args.eval_only:
+        break
     print('\nEpoch: {}'.format(epoch))
 
     train(epoch)
@@ -313,5 +349,36 @@ for epoch in range(args.epochs):
     elif args.dataset == 'MNIST' and epoch % 1 == 0:
         utils.save_images(epoch, model, args.cond)
 
+model_name = f'{args.flow}_model_scripted_{args.dataset}'
+if not args.eval_only:
+    # save 
+    torch.save(best_model, model_name)
+else:
+    # load model
+    best_model = torch.load(model_name)
 
-validate(best_validation_epoch, best_model, test_loader, prefix='Test')
+
+# validate(best_validation_epoch, best_model, test_loader, prefix='Test')
+test_data = validate(best_validation_epoch, best_model, test_loader, prefix='Test', full_data=True)
+val_data = validate(best_validation_epoch, best_model, valid_loader, prefix='val', full_data=True)
+train_data = validate(best_validation_epoch, best_model, train_loader, prefix='train', full_data=True)
+precision, recall, thresholds = calc_performance(val_data=val_data,test_data=test_data,val_ratio=100)
+plt.plot(recall,precision)
+plt.savefig(f"recall_precision_curve_{model_name}.png")
+plt.close('all')
+# np.save('realnvp_test_data.npy',test_data)
+# np.save('realnvp_val_data.npy',val_data)
+
+
+nan_array = np.isnan(test_data)
+not_nan_array = ~ nan_array
+test_data = test_data[not_nan_array]
+plt.hist(test_data, bins=1000, range=(-400,300),alpha=0.5, weights=np.ones(len(test_data)) / len(test_data))
+plt.hist(val_data, bins=1000, range=(-400,300), alpha=0.5, weights=np.ones(len(val_data)) / len(val_data))
+plt.hist(train_data, bins=1000, range=(-400,300), alpha=0.5, weights=np.ones(len(train_data)) / len(train_data))
+
+plt.legend(["test", "validation", "train"])
+plt.savefig(f"likelihood_hist_{model_name}.png")
+ipdb.set_trace()
+
+

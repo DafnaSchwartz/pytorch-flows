@@ -3,6 +3,7 @@ import numpy as np
 
 import datasets
 import datasets.util
+import ipdb
 
 
 class POWER:
@@ -21,6 +22,7 @@ class POWER:
         self.tst = self.Data(tst)
 
         self.n_dims = self.trn.x.shape[1]
+        
 
     def show_histograms(self, split):
 
@@ -41,9 +43,10 @@ def load_data_split_with_noise():
     rng = np.random.RandomState(42)
 
     data = load_data()
+    ipdb.set_trace()
     rng.shuffle(data)
     N = data.shape[0]
-
+    
     data = np.delete(data, 3, axis=1)
     data = np.delete(data, 1, axis=1)
     ############################
@@ -74,6 +77,7 @@ def load_data_normalised():
 
     data_train, data_validate, data_test = load_data_split_with_noise()
     data = np.vstack((data_train, data_validate))
+    ipdb.set_trace()
     mu = data.mean(axis=0)
     s = data.std(axis=0)
     data_train = (data_train - mu) / s
